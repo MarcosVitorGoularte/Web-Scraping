@@ -1,0 +1,781 @@
+import requests
+import csv
+import pandas as pd
+from bs4 import BeautifulSoup
+from openpyxl import Workbook
+import concurrent.futures
+from deep_translator import GoogleTranslator
+import multiprocessing
+import os
+import re
+import xlsxwriter
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Alignment, Border, Side
+
+
+dfs = []
+
+max_retries = 3  # Número máximo de tentativas
+num_pages = 9  # Número total de páginas
+
+def scrape_page(i):
+    start = i * 2000
+    url = f'https://www.drugsdata.org/index.php?sort=DatePublishedU+desc&start={start}&a=&search_field=-&m1=-1&m2=-1&sold_as_ecstasy=both&datefield=tested&max=2000'
+
+    for retry in range(max_retries):
+        try:
+            print(f"Conectando-se com a página {i+1}")
+            response = requests.get(url, timeout=30)
+
+            if response.status_code == 200:
+                print(f"Conexão bem sucedida com a página {i+1}")
+
+                soup = BeautifulSoup(response.content, 'html.parser')
+                table = soup.find('table', id='MainResults')
+                rows = table.find_all('tr')
+
+                data = []
+
+                for row in rows[2:]:
+                    cells = row.find_all('td')
+
+                    if len(cells) >= 3:
+                        sample_name_cell = cells[1].find('a')
+                        sample_name = sample_name_cell.text
+
+                        if 'cocaine' in sample_name.lower():
+                            sample_detail_url = sample_name_cell['href']
+                            detail_response = requests.get('https://www.drugsdata.org/' + sample_detail_url)
+                            detail_soup = BeautifulSoup(detail_response.content, 'html.parser')
+                            aka_info_elements = detail_soup.find('ul', class_='Substance').find_all('li')
+
+                            # Extraindo as informações adicionais
+                            size_row = detail_soup.find('th', string='Size:')
+                            size_cell = size_row.find_next_sibling('td')
+                            size = size_cell.text.strip() if size_cell else '-'
+
+                            additional_info_list = []
+                            for element in aka_info_elements:
+                                text = element.get_text(strip=True)
+                                aka_info_index = text.find('aka')
+
+                                if aka_info_index != -1:
+                                    aka_info = text[aka_info_index + 3:].strip()
+                                else:
+                                    aka_info = '-'
+
+                                additional_info_list.append(aka_info)
+
+                            substances = cells[2].find('ul', class_='Substance').find_all('li')
+                            substances_list = [substance.text for substance in substances]
+
+                            amounts_element = cells[3].find('ul', class_='Amounts')
+                            amounts_list = [amount.text for amount in amounts_element.find_all('li')] if amounts_element else []
+
+                            date_published = cells[4].text.strip()
+                            location = cells[5].text.strip()
+
+                            additional_info = '\n'.join(additional_info_list) if additional_info_list else '-'
+                            substances = '\n'.join(substances_list) if substances_list else '-'
+                            amounts = '\n'.join(amounts_list) if amounts_list else '-'
+
+                            # Dividir elementos em excesso em múltiplas linhas
+                            max_length = max(len(substances_list), len(amounts_list), len(additional_info_list))
+                            for i in range(max_length):
+                                if i == 0:
+                                    data.append([sample_name, size, substances_list[i] if i < len(substances_list) else '-',
+                                                additional_info_list[i] if i < len(additional_info_list) else '-',
+                                                amounts_list[i] if i < len(amounts_list) else '-', date_published, location])
+                                else:
+                                    data.append(['', '', substances_list[i] if i < len(substances_list) else '-',
+                                                additional_info_list[i] if i < len(additional_info_list) else '-',
+                                                amounts_list[i] if i < len(amounts_list) else '-', '', ''])
+
+                df = pd.DataFrame(data, columns=['Nome da Amostra', 'Tamanho', 'Substâncias', 'Informações Adicionais', 'Quantidades',
+                                                'Data de Publicação', 'Localização'])
+
+                return df
+
+            else:
+                print(f"Tentativa de conexão {retry+1} falhada para a página {i+1}: HTTP status code {response.status_code}")
+                if retry == max_retries - 1:
+                    print(f"Máximo de tentativas atingido para a página {i+1}. Pulando...")
+
+        except requests.exceptions.RequestException as e:
+            print(f"Tentativa de conexão {retry+1} falhada para a página {i+1}: {str(e)}")
+            if retry == max_retries - 1:
+                print(f"Máximo de tentativas atingido para a página {i+1}. Pulando...")
+
+with concurrent.futures.ThreadPoolExecutor() as executor:
+    results = executor.map(scrape_page, range(num_pages))
+    dfs.extend(results)
+
+output = pd.concat(dfs, ignore_index=True)
+
+filename = 'tabeladedrogascompletaeminglês.xlsx'
+output.to_excel(filename, index=False)
+
+#########################################################################################################################################
+
+# Carregue o arquivo Excel
+excel_file = "tabeladedrogascompletaeminglês.xlsx"
+df = pd.read_excel(excel_file)
+
+# Colunas a serem traduzidas
+colunas_para_traduzir = ['Nome da Amostra', 'Substâncias', 'Informações Adicionais', 'Data de Publicação']
+
+# Função para traduzir o texto
+def traduzir_texto(texto, coluna_name):
+    if pd.notna(texto) and texto != '-':
+        try:
+            nome_traduzido = GoogleTranslator(source='en', target='pt').translate(texto)
+            nome_original = GoogleTranslator(source='en', target='en').translate(texto)
+
+            # Verifica se a coluna é 'Nome da Amostra' e ajusta a capitalização
+            if coluna_name == 'Nome da Amostra':
+                nome_traduzido = ' '.join(word.capitalize() for word in nome_traduzido.split())
+
+            if coluna_name == 'Informações Adicionais':
+                return f"Também conhecido como {nome_traduzido} ({nome_original})"
+            elif coluna_name == 'Substâncias':
+                return f"{nome_traduzido} ({nome_original})"
+            else:
+                return nome_traduzido
+        except Exception as e:
+            return str(e)
+    else:
+        return texto
+
+def traduzir_coluna(coluna, coluna_name):
+    return coluna.apply(traduzir_texto, args=(coluna_name,))
+
+with multiprocessing.Pool() as pool:
+    results = pool.starmap(traduzir_coluna, [(df[col], col) for col in colunas_para_traduzir])
+
+for i, col in enumerate(colunas_para_traduzir):
+    df[col] = results[i]
+
+df.to_excel("tabeladedrogascompletaemportuguês.xlsx", index=False)
+
+#############################################################################################################################################
+
+excel_file = "tabeladedrogascompletaemportuguês.xlsx"
+df = pd.read_excel(excel_file)
+
+# Função para substituir "Rachaduras" por "Crack" em uma coluna
+def substituir_rachaduras(texto):
+    if pd.notna(texto) and texto != '-':
+        return texto.replace("Rachadura", "Crack")
+    else:
+        return texto
+
+# Função para substituir "-" por "Inositol" na coluna 'Substâncias'
+def substituir_hifen_por_inositol(texto):
+    if pd.notna(texto) and texto == '-':
+        return 'Inositol'
+    else:
+        return texto
+
+# Função para substituir "trace" por "Vestígio"
+def substituir_trace_por_vestigio(texto):
+    if pd.notna(texto):
+        return texto.replace("trace", "Vestígio")
+    else:
+        return texto
+
+def substituir_sigla_por_nome(texto):
+    if pd.notna(texto):
+        texto = texto.replace("CA", "California")
+        texto = texto.replace("MA", "Massachusetts")
+        texto = texto.replace("IL", "Illinois")
+        texto = texto.replace("NY", "New York")
+        texto = texto.replace("PA", "Pennsylvania")
+        texto = texto.replace("WA", "Washington")
+        texto = texto.replace("FL", "Florida")
+        texto = texto.replace("GA", "Georgia")
+        texto = texto.replace("MD", "Maryland")
+        texto = texto.replace("SC", "South Carolina")
+        texto = texto.replace("NH", "New Hampshire")
+        texto = texto.replace("MS", "Mississippi")
+        texto = texto.replace("MI", "Michigan")
+        texto = texto.replace("OR", "Oregon")
+        texto = texto.replace("MT", "Montana")
+        texto = texto.replace("MO", "Missouri")
+        texto = texto.replace("IA", "Iowa")
+        texto = texto.replace("CO", "Colorado")
+        texto = texto.replace("TX", "Texas")
+        texto = texto.replace("WI", "Wisconsin")
+        texto = texto.replace("AZ", "Arizona")
+        texto = texto.replace("UT", "Utah")
+        texto = texto.replace("NM", "New Mexico")
+        texto = texto.replace("AK", "Alaska")
+        texto = texto.replace("VA", "Virginia")
+        texto = texto.replace("OH", "Ohio")
+        texto = texto.replace("NC", "North Carolina")
+        texto = texto.replace("DC", "District of Columbia")
+        texto = texto.replace("NV", "Nevada")
+        texto = texto.replace("BC", "British Columbia")
+        texto = texto.replace("NJ", "New Jersey")
+        texto = texto.replace("CT", "Connecticut")
+        texto = texto.replace("MN", "Minnesota")
+        texto = texto.replace("Unknown", "Desconhecido")
+        return texto
+    else:
+        return texto
+
+colunas_para_substituir = ['Nome da Amostra', 'Substâncias', 'Informações Adicionais', 'Data de Publicação', 'Localização']
+
+for col in colunas_para_substituir:
+    df[col] = df[col].apply(substituir_rachaduras)
+
+df['Substâncias'] = df['Substâncias'].apply(substituir_hifen_por_inositol)
+
+df = df.applymap(substituir_trace_por_vestigio)
+df = df.applymap(substituir_sigla_por_nome)
+
+df.to_excel("tabeladedrogascompletaemportuguês.xlsx", index=False)
+
+#############################################################################################################################################
+
+filename = '/content/tabeladedrogascompletaemportuguês.xlsx'
+df = pd.read_excel(filename)
+
+value_counts = df['Nome da Amostra'].value_counts().reset_index()
+
+value_counts.columns = ['Nome da Amostra', 'Número de Amostras']
+
+total_amostras = value_counts['Número de Amostras'].sum()
+value_counts['Porcentagem (%)'] = (value_counts['Número de Amostras'] / total_amostras) * 100
+
+value_counts['Porcentagem (%)'] = value_counts['Porcentagem (%)'].apply(lambda x: f'{x:.3f}'.replace('.', ',') + '%')
+
+total_row = pd.DataFrame({'Nome da Amostra': ['Total'],
+                          'Número de Amostras': [total_amostras],
+                          'Porcentagem (%)': ['100%']})
+
+df_with_total = pd.concat([value_counts, total_row], ignore_index=True)
+
+output_filename = 'tabela_qtd_total_amostras.xlsx'
+
+df_with_total.to_excel(output_filename, index=False)
+print(f'O DataFrame foi exportado para o arquivo {output_filename}.')
+
+df = pd.read_excel('/content/tabeladedrogascompletaemportuguês.xlsx')
+
+# Remova os espaços em branco da coluna 'Tamanho'
+df['Tamanho'] = df['Tamanho'].str.replace(' ', '')
+
+# Crie uma nova coluna 'Amostra' combinando 'Nome da Amostra' e 'Tamanho'
+df['Amostra'] = df['Nome da Amostra'] + ' - ' + df['Tamanho']
+
+# Reorganize as colunas para que 'Amostra' seja a primeira coluna
+df = df[['Amostra', 'Tamanho'] + [col for col in df.columns if col != 'Amostra' and col != 'Tamanho']]
+
+df.drop(['Nome da Amostra', 'Tamanho'], axis=1, inplace=True)
+
+df.to_excel('tabelafinal.xlsx', index=False)
+
+print("Informações da coluna 'Amostra' unidas e salvas com sucesso.")
+
+excel_file = "tabeladedrogascompletaemportuguês.xlsx"
+
+os.remove(excel_file)
+
+###########################################################################################################################################################
+
+df = pd.read_excel('/content/tabelafinal.xlsx')
+
+tabelas = {}
+
+for index, row in df.iterrows():
+    if isinstance(row['Amostra'], str) and '-' in row['Amostra']:
+        nome_amostra, tamanho = row['Amostra'].split(' - ')
+
+        if nome_amostra not in tabelas:
+            tabelas[nome_amostra] = {'Tamanho': [], 'Número de vezes': []}
+
+        tabelas[nome_amostra]['Tamanho'].append(tamanho)
+        tabelas[nome_amostra]['Número de vezes'].append(1)
+
+wb = Workbook()
+
+# Crie as tabelas separadas e salve-as em planilhas com nomes de A a Z (ou números)
+for i, (nome, dados) in enumerate(tabelas.items()):
+    tabela = pd.DataFrame(dados)
+    tabela_contagem = tabela.groupby('Tamanho').count().reset_index()
+
+    # Ordene a tabela em ordem decrescente
+    tabela_contagem = tabela_contagem.sort_values(by='Número de vezes', ascending=False)
+
+    total_vezes = tabela_contagem['Número de vezes'].sum()
+    tabela_contagem['Porcentagem'] = (tabela_contagem['Número de vezes'] / total_vezes * 100).apply(lambda x: '{:.3f}%'.format(x).replace('.', ','))
+
+    # Escolha o nome da planilha
+    nome_planilha = chr(ord('A') + i) if i < 26 else f'Sheet_{i - 25}'
+
+    ws = wb.create_sheet(title=nome_planilha)
+
+    ws.append([nome])
+
+    for r_idx, row in enumerate(dataframe_to_rows(tabela_contagem, index=False, header=True), 1):
+        for c_idx, value in enumerate(row, 1):
+            cell = ws.cell(row=r_idx + 1, column=c_idx, value=value)
+            cell.alignment = Alignment(horizontal='center')
+
+            if r_idx == 1:
+                ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(row))
+
+    total_row = ['Total', total_vezes, '100%']
+    ws.append(total_row)
+
+del wb['Sheet']
+
+wb.save('tabelas_qtd_mg_amostras.xlsx')
+
+###################################################################################################################################################
+
+excel_file = '/content/tabelafinal.xlsx'
+df = pd.read_excel(excel_file)
+
+substance_tables = {}
+razao_count = {}
+
+for index, row in df.iterrows():
+    substance_name = row['Substâncias']
+    quantity = row['Quantidades']
+
+    if substance_name not in substance_tables:
+        substance_tables[substance_name] = pd.DataFrame(columns=['Razão', 'Número de vezes'])
+
+    existing_row = substance_tables[substance_name][substance_tables[substance_name]['Razão'] == quantity]
+
+    if existing_row.empty:
+        new_row = pd.DataFrame({'Razão': [quantity], 'Número de vezes': [1]})
+        substance_tables[substance_name] = pd.concat([substance_tables[substance_name], new_row], ignore_index=True)
+
+        razao_count[substance_name + str(quantity)] = 1
+    else:
+        existing_index = existing_row.index[0]
+        razao_count[substance_name + str(quantity)] += 1
+        substance_tables[substance_name].at[existing_index, 'Número de vezes'] = razao_count[substance_name + str(quantity)]
+
+output_file = '/content/tabelas_razoes_interferentes.xlsx'
+workbook = xlsxwriter.Workbook(output_file)
+
+for sheet_name, substance_table in substance_tables.items():
+    worksheet = workbook.add_worksheet()
+
+    worksheet.merge_range('A1:C1', f'Substância: {sheet_name}')
+
+    substance_table = substance_table.sort_values(by='Número de vezes', ascending=False)
+
+    total_vezes = substance_table['Número de vezes'].sum()
+    substance_table['Porcentagem'] = (substance_table['Número de vezes'] / total_vezes * 100).apply(lambda x: '{:.3f}%'.format(x).replace('.', ','))
+
+    for col_num, column_name in enumerate(substance_table.columns):
+        worksheet.write(1, col_num, column_name)  # Escreve os nomes das colunas
+
+    for row_num, (_, row_data) in enumerate(substance_table.iterrows(), start=2):
+        for col_num, value in enumerate(row_data):
+            worksheet.write(row_num, col_num, value)
+
+    total_row = ['Total', total_vezes, '100,000%']
+    for col_num, value in enumerate(total_row):
+        worksheet.write(substance_table.shape[0] + 2, col_num, value)
+
+workbook.close()
+
+print(f"Tabelas exportadas para o arquivo Excel '{output_file}'")
+
+#################################################################################################################################################################
+
+excel_file = '/content/tabelafinal.xlsx'
+df = pd.read_excel(excel_file)
+
+substance_counts = df['Substâncias'].value_counts().reset_index()
+substance_counts.columns = ['Substância', 'Contagem']
+
+total_contagem = substance_counts['Contagem'].sum()
+substance_counts['Porcentagem'] = (substance_counts['Contagem'] / total_contagem * 100).apply(lambda x: '{:.3f}%'.format(x).replace('.', ','))
+
+total_row = ['Total', total_contagem, '100%']
+substance_counts.loc[len(substance_counts)] = total_row
+
+wb = Workbook()
+ws = wb.active
+
+headers = list(substance_counts.columns)
+ws.append(headers)
+
+for r in dataframe_to_rows(substance_counts, index=False, header=False):
+    ws.append(r)
+
+output_file = '/content/listagem_interferentes.xlsx'
+wb.save(output_file)
+
+print(f"Contagem de interferentes exportada para o arquivo Excel '{output_file}'")
+
+##############################################################################################################################################
+
+excel_file = '/content/tabelafinal.xlsx'
+df = pd.read_excel(excel_file)
+
+# Exclua as ocorrências de "Cocaína"
+df_filtered = df[df['Substâncias'] != 'Cocaína (Cocaine)']
+
+substance_counts = df_filtered['Substâncias'].value_counts().reset_index()
+substance_counts.columns = ['Substância', 'Contagem']
+
+total_contagem = substance_counts['Contagem'].sum()
+substance_counts['Porcentagem'] = (substance_counts['Contagem'] / total_contagem * 100).apply(lambda x: '{:.3f}%'.format(x).replace('.', ','))
+
+total_row = ['Total', total_contagem, '100%']
+substance_counts.loc[len(substance_counts)] = total_row
+
+wb = Workbook()
+ws = wb.active
+
+headers = list(substance_counts.columns)
+ws.append(headers)
+
+for r in dataframe_to_rows(substance_counts, index=False, header=False):
+    ws.append(r)
+
+output_file = '/content/listagem_interferentes_sem_cocaina.xlsx'
+wb.save(output_file)
+
+print(f"Contagem de interferentes (sem Cocaína) exportada para o arquivo Excel '{output_file}'")
+
+################################################################################################################################################
+
+
+caminho_arquivo_excel = '/content/tabeladedrogascompletaeminglês.xlsx'
+dados_excel = pd.read_excel(caminho_arquivo_excel)
+
+dados_excel['Data de Publicação'] = dados_excel['Data de Publicação'].str.extract('(\w{3} \d{2}, \d{4})')
+dados_excel['Data de Publicação'] = pd.to_datetime(dados_excel['Data de Publicação'], errors='coerce')
+
+dados_excel['Ano'] = dados_excel['Data de Publicação'].dt.year
+
+contagem_por_ano = dados_excel['Ano'].value_counts().sort_index()
+
+df_resultado = pd.DataFrame({
+    'Ano': contagem_por_ano.index,
+    'Número de amostras': contagem_por_ano.values,
+})
+
+df_resultado['Porcentagem do total'] = ((df_resultado['Número de amostras'] / df_resultado['Número de amostras'].sum()) * 100).round(3).astype(str) + '%'
+df_resultado['Porcentagem do total'] = df_resultado['Porcentagem do total'].str.replace('.', ',')
+
+df_resultado = df_resultado.sort_values(by='Número de amostras', ascending=False)
+
+df_resultado['Ano'] = df_resultado['Ano'].astype(int)
+
+total_row = pd.DataFrame({
+    'Ano': ['Total'],
+    'Número de amostras': [df_resultado['Número de amostras'].sum()],
+    'Porcentagem do total': ['100%'],
+})
+
+df_resultado = pd.concat([df_resultado, total_row], ignore_index=True)
+
+caminho_arquivo_saida = '/content/numerototaldeamostrasporano.xlsx'
+
+wb = Workbook()
+ws = wb.active
+
+ws.merge_cells('A1:C1')
+ws['A1'] = 'Número total de Amostras por Ano'
+
+for r_idx, row in enumerate(dataframe_to_rows(df_resultado, index=False, header=True), 2):
+    for c_idx, value in enumerate(row, 1):
+        cell = ws.cell(row=r_idx, column=c_idx, value=value)
+        cell.alignment = Alignment(horizontal='center')
+
+wb.save(caminho_arquivo_saida)
+
+##########################################################################################################################################
+
+caminho_arquivo_excel = '/content/tabeladedrogascompletaeminglês.xlsx'
+dados_excel = pd.read_excel(caminho_arquivo_excel)
+
+dados_excel['Data de Publicação'] = dados_excel['Data de Publicação'].str.extract('(\w{3} \d{2}, \d{4})')
+dados_excel['Data de Publicação'] = pd.to_datetime(dados_excel['Data de Publicação'], errors='coerce')
+
+dados_excel['Mês'] = dados_excel['Data de Publicação'].dt.month_name()
+
+mapa_meses = {
+    'January': 'Janeiro',
+    'February': 'Fevereiro',
+    'March': 'Março',
+    'April': 'Abril',
+    'May': 'Maio',
+    'June': 'Junho',
+    'July': 'Julho',
+    'August': 'Agosto',
+    'September': 'Setembro',
+    'October': 'Outubro',
+    'November': 'Novembro',
+    'December': 'Dezembro'
+}
+
+dados_excel['Mês'] = dados_excel['Mês'].map(mapa_meses)
+
+contagem_por_mes = dados_excel['Mês'].value_counts().sort_index()
+
+df_resultado_mes = pd.DataFrame({
+    'Mês': contagem_por_mes.index,
+    'Número de amostras': contagem_por_mes.values,
+})
+
+df_resultado_mes['Porcentagem do total'] = ((df_resultado_mes['Número de amostras'] / df_resultado_mes['Número de amostras'].sum()) * 100).round(3).astype(str) + '%'
+df_resultado_mes['Porcentagem do total'] = df_resultado_mes['Porcentagem do total'].str.replace('.', ',')
+
+df_resultado_mes = df_resultado_mes.sort_values(by='Número de amostras', ascending=False)
+
+total_row_mes = pd.DataFrame({
+    'Mês': ['Total'],
+    'Número de amostras': [df_resultado_mes['Número de amostras'].sum()],
+    'Porcentagem do total': ['100%'],
+})
+
+df_resultado_mes = pd.concat([df_resultado_mes, total_row_mes], ignore_index=True)
+
+caminho_arquivo_saida_mes = '/content/numerototaldeamostraspormes.xlsx'
+
+wb = Workbook()
+ws = wb.active
+
+ws.merge_cells('A1:C1')
+ws['A1'] = 'Número total de Amostras por Mês'
+
+for r_idx, row in enumerate(dataframe_to_rows(df_resultado_mes, index=False, header=True), 2):
+    for c_idx, value in enumerate(row, 1):
+        cell = ws.cell(row=r_idx, column=c_idx, value=value)
+        cell.alignment = Alignment(horizontal='center')
+
+wb.save(caminho_arquivo_saida_mes)
+
+########################################################################################################################################################################################
+
+caminho_arquivo_excel = '/content/tabeladedrogascompletaeminglês.xlsx'
+dados_excel = pd.read_excel(caminho_arquivo_excel)
+
+dados_excel['Data de Publicação'] = dados_excel['Data de Publicação'].str.extract('(\w{3} \d{2}, \d{4})')
+dados_excel['Data de Publicação'] = pd.to_datetime(dados_excel['Data de Publicação'], errors='coerce')
+
+dados_excel['Ano'] = dados_excel['Data de Publicação'].dt.year
+
+contagem_por_ano = dados_excel['Ano'].value_counts().sort_index()
+
+mapa_meses = {
+    'January': 'Janeiro',
+    'February': 'Fevereiro',
+    'March': 'Março',
+    'April': 'Abril',
+    'May': 'Maio',
+    'June': 'Junho',
+    'July': 'Julho',
+    'August': 'Agosto',
+    'September': 'Setembro',
+    'October': 'Outubro',
+    'November': 'Novembro',
+    'December': 'Dezembro'
+}
+
+wb = Workbook()
+
+for ano in contagem_por_ano.index:
+    df_ano = dados_excel[dados_excel['Ano'] == ano]
+    contagem_por_mes = df_ano['Data de Publicação'].dt.month_name().map(mapa_meses).value_counts().sort_index()
+
+    df_resultado_mes = pd.DataFrame({
+        'Mês': list(mapa_meses.values()),
+        'Número de amostras': [0] * 12
+    })
+
+    df_resultado_mes.loc[df_resultado_mes['Mês'].isin(contagem_por_mes.index), 'Número de amostras'] = contagem_por_mes.values
+
+    total_amostras = df_resultado_mes['Número de amostras'].sum()
+    df_resultado_mes['Porcentagem do total'] = ((df_resultado_mes['Número de amostras'] / total_amostras) * 100).round(3).astype(str) + '%'
+    df_resultado_mes['Porcentagem do total'] = df_resultado_mes['Porcentagem do total'].str.replace('.', ',')
+
+    df_resultado_mes = df_resultado_mes.sort_values(by='Número de amostras', ascending=False)
+
+    ws = wb.create_sheet(title=f'Ano_{ano}')
+
+    for r_idx, row in enumerate(dataframe_to_rows(df_resultado_mes, index=False, header=True), 1):
+        for c_idx, value in enumerate(row, 1):
+            cell = ws.cell(row=r_idx + 1, column=c_idx, value=value)
+            cell.alignment = Alignment(horizontal='center')
+
+            if r_idx == 1:
+                ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(row))
+
+    ws.cell(row=1, column=1, value=f'Ano: {int(ano)}')
+
+    ws.cell(row=1, column=1).alignment = Alignment(horizontal='center')
+
+    ws.append(['Total:', total_amostras, '100%'])
+
+del wb['Sheet']
+
+wb.save('/content/amostras_por_mes_anos.xlsx')
+
+############################################################################################################################################################################################
+
+df = pd.read_excel('tabelafinal.xlsx')
+
+estados_americanos = [
+    'Alabama', 'Alaska', 'Arizona', 'Arkansas', 'California', 'Colorado', 'Connecticut', 'Delaware', 'Florida',
+    'Georgia', 'Hawaii', 'Idaho', 'Illinois', 'Indiana', 'Iowa', 'Kansas', 'Kentucky', 'Louisiana', 'Maine',
+    'Maryland', 'Massachusetts', 'Michigan', 'Minnesota', 'Mississippi', 'Missouri', 'Montana', 'Nebraska',
+    'Nevada', 'New Hampshire', 'New Jersey', 'New Mexico', 'New York', 'North Carolina', 'North Dakota', 'Ohio',
+    'Oklahoma', 'Oregon', 'Pennsylvania', 'Rhode Island', 'South Carolina', 'South Dakota', 'Tennessee', 'Texas',
+    'Utah', 'Vermont', 'Virginia', 'Washington', 'West Virginia', 'Wisconsin', 'Wyoming'
+]
+
+df['Localização'] = df['Localização'].fillna('')
+
+df_filtrado = df[df['Localização'].str.contains('|'.join(estados_americanos))]
+
+contagem_localizacao = df_filtrado['Localização'].value_counts()
+
+contagem_localizacao_df = contagem_localizacao.reset_index()
+contagem_localizacao_df.columns = ['Localização (EUA)', 'Contagem']
+
+total_cidades = contagem_localizacao_df['Contagem'].sum()
+
+contagem_localizacao_df['Porcentagem (%)'] = (contagem_localizacao_df['Contagem'] / total_cidades * 100).round(3).astype(str) + '%'
+
+contagem_localizacao_df['Porcentagem (%)'] = contagem_localizacao_df['Porcentagem (%)'].str.replace('.', ',')
+
+contagem_localizacao_df.loc[len(contagem_localizacao_df)] = ['Total de localizações:', total_cidades, '100%']
+
+contagem_localizacao_df.to_excel('contagem_localizacao_EUA.xlsx', index=False)
+
+print("Arquivo 'contagem_localizacao_EUA.xlsx' exportado com sucesso.")
+
+#################################################################################################################################################################################################
+
+df = pd.read_excel('tabelafinal.xlsx')
+
+estados_americanos = [
+    'Alabama', 'Alaska', 'Arizona', 'Arkansas', 'California', 'Colorado', 'Connecticut', 'Delaware', 'Florida',
+    'Georgia', 'Hawaii', 'Idaho', 'Illinois', 'Indiana', 'Iowa', 'Kansas', 'Kentucky', 'Louisiana', 'Maine',
+    'Maryland', 'Massachusetts', 'Michigan', 'Minnesota', 'Mississippi', 'Missouri', 'Montana', 'Nebraska',
+    'Nevada', 'New Hampshire', 'New Jersey', 'New Mexico', 'New York', 'North Carolina', 'North Dakota', 'Ohio',
+    'Oklahoma', 'Oregon', 'Pennsylvania', 'Rhode Island', 'South Carolina', 'South Dakota', 'Tennessee', 'Texas',
+    'Utah', 'Vermont', 'Virginia', 'Washington', 'West Virginia', 'Wisconsin', 'Wyoming'
+]
+
+df['Localização'] = df['Localização'].fillna('')
+
+df_filtrado_nao_eua = df[~df['Localização'].str.contains('|'.join(estados_americanos)) & (df['Localização'] != '')]
+
+contagem_localizacao_nao_eua = df_filtrado_nao_eua['Localização'].value_counts()
+
+contagem_localizacao_nao_eua_df = contagem_localizacao_nao_eua.reset_index()
+contagem_localizacao_nao_eua_df.columns = ['Localização (Mundo)', 'Contagem']
+
+total_localizacoes = contagem_localizacao_nao_eua_df['Contagem'].sum()
+
+contagem_localizacao_nao_eua_df['Porcentagem (%)'] = (contagem_localizacao_nao_eua_df['Contagem'] / total_localizacoes * 100).round(3).astype(str) + '%'
+
+contagem_localizacao_nao_eua_df['Porcentagem (%)'] = contagem_localizacao_nao_eua_df['Porcentagem (%)'].str.replace('.', ',')
+
+contagem_localizacao_nao_eua_df.loc[len(contagem_localizacao_nao_eua_df)] = ['Total de localizações:', total_localizacoes, '100%']
+
+contagem_localizacao_nao_eua_df.to_excel('contagemlocalizacao_SEM_EUA.xlsx', index=False)
+
+print("Arquivo 'contagemlocalizacaosemeua.xlsx' exportado com sucesso.")
+
+#####################################################################################################################################################################################################
+
+wb = load_workbook("tabelafinal.xlsx")
+
+ws = wb.active
+
+last_row = ws.max_row
+
+for row in ws.iter_rows(min_row=1, max_row=last_row, min_col=1, max_col=ws.max_column):
+    for cell in row:
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+for col in range(1, 7):
+    last_value = None
+
+    for row in range(1, last_row + 1):
+        cell_value = ws.cell(row=row, column=col).value
+
+        if cell_value:
+            if last_value is not None and row - 1 > last_value[0]:
+                ws.merge_cells(start_row=last_value[0], start_column=col, end_row=row - 1, end_column=col)
+
+            last_value = (row, cell_value)
+
+    if last_value is not None and last_value[0] < last_row:
+        ws.merge_cells(start_row=last_value[0], start_column=col, end_row=last_row, end_column=col)
+
+wb.save("tabelafinal.xlsx")
+
+######################################################################################################################################################################################################
+
+arquivos = ["numerototaldeamostrasporano.xlsx", "numerototaldeamostraspormes.xlsx", "tabela_qtd_total_amostras.xlsx", "listagem_interferentes.xlsx", "listagem_interferentes_sem_cocaina.xlsx"]
+
+for arquivo in arquivos:
+    wb = load_workbook(arquivo)
+
+    for ws in wb.worksheets:
+        cell_range = ws.dimensions
+
+        blue_fill = PatternFill(start_color="FFA54F", end_color="FFA54F", fill_type="solid")
+        alignment = Alignment(horizontal='center', vertical='center')
+        thick_border = Border(left=Side(style='medium'),
+                              right=Side(style='medium'),
+                              top=Side(style='medium'),
+                              bottom=Side(style='medium'))
+
+        for row in ws[cell_range]:
+            for cell in row:
+                cell.fill = blue_fill
+                cell.alignment = alignment
+                cell.border = thick_border
+
+    wb.save(f"{arquivo[:-5]}.xlsx")
+
+print("Formatação concluída para todos os arquivos.")
+
+########################################################################################################################################################################################################
+
+arquivos = ["tabelafinal.xlsx", "tabelas_qtd_mg_amostras.xlsx", "tabelas_razoes_interferentes.xlsx", "contagem_localizacao_EUA.xlsx", "contagemlocalizacao_SEM_EUA.xlsx", "amostras_por_mes_anos.xlsx"]
+
+for arquivo in arquivos:
+    wb = load_workbook(arquivo)
+
+    for ws in wb.worksheets:
+        cell_range = ws.dimensions
+
+        blue_fill = PatternFill(start_color="87CEEB", end_color="87CEEB", fill_type="solid")
+        alignment = Alignment(horizontal='center', vertical='center')
+        thick_border = Border(left=Side(style='medium'),
+                              right=Side(style='medium'),
+                              top=Side(style='medium'),
+                              bottom=Side(style='medium'))
+
+        for row in ws[cell_range]:
+            for cell in row:
+                cell.fill = blue_fill
+                cell.alignment = alignment
+                cell.border = thick_border
+
+    wb.save(f"{arquivo[:-5]}.xlsx")
+
+print("Formatação concluída para todos os arquivos.")
+
+#########################################################################################################################################################################################################
+
+excel_file = "tabeladedrogascompletaeminglês.xlsx"
+
+os.remove(excel_file)
